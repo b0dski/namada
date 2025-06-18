@@ -5467,8 +5467,7 @@ dependencies = [
 [[package]]
 name = "nam-sparse-merkle-tree"
 version = "0.3.2-nam.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fae108a0f6aabf789e34d6d447c1184608d1c70c087f957b720042226a47ab63"
+source = "git+https://github.com/b0dski/sparse-merkle-tree.git?branch=validate-perf#88b974d10c35ece30faf94e14b9c725d8e32d54b"
 dependencies = [
  "blake2b-rs",
  "borsh",

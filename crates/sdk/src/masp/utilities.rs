@@ -1,6 +1,7 @@
 //! Helper functions and types
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::{Arc, RwLock};
 
 use borsh::BorshDeserialize;
@@ -157,27 +158,12 @@ impl<C: Client + Send + Sync> MaspClient for LedgerMaspClient<C> {
         from: BlockHeight,
         to: BlockHeight,
     ) -> Result<Vec<IndexedNoteEntry>, Error> {
-        const ZERO: Duration = Duration::from_secs(0);
-        let current_backoff = { *self.inner.backoff.read().unwrap() };
-
-        if current_backoff > ZERO {
-            self.inner
-                .sleep
-                .sleep_with_current_backoff(&current_backoff)
-                .await;
-        }
-
-        let result = self.fetch_shielded_transfers_inner(from, to).await;
-
-        if result.is_err() {
-            let mut backoff = self.inner.backoff.write().unwrap();
-            self.inner.sleep.strategy.next_state(&mut *backoff);
-        } else if current_backoff > ZERO {
-            let mut backoff = self.inner.backoff.write().unwrap();
-            self.inner.sleep.strategy.prev_state(&mut *backoff);
-        }
-
-        result
+        with_retry(
+            &self.inner.backoff,
+            &self.inner.sleep,
+            self.fetch_shielded_transfers_inner(from, to),
+        )
+        .await
     }
 
     #[inline(always)]
@@ -237,6 +223,10 @@ struct IndexerMaspClientShared {
     block_index: init_once::InitOnce<Option<(BlockHeight, xorf::BinaryFuse16)>>,
     /// Maximum number of concurrent fetches.
     max_concurrent_fetches: usize,
+    /// Sleep backoff between failed requests.
+    backoff: RwLock<Duration>,
+    /// Backoff sleep strategy.
+    sleep: Sleep<LinearBackoff>,
 }
 
 /// MASP client implementation that queries data from the
@@ -268,6 +258,7 @@ impl IndexerMaspClient {
         indexer_api: reqwest::Url,
         using_block_index: bool,
         max_concurrent_fetches: usize,
+        linear_backoff_delta: Duration,
     ) -> Self {
         let shared = Arc::new(IndexerMaspClientShared {
             indexer_api,
@@ -279,6 +270,12 @@ impl IndexerMaspClient {
                     index.init(|| None);
                 }
                 index
+            },
+            backoff: RwLock::new(Duration::from_secs(0)),
+            sleep: Sleep {
+                strategy: LinearBackoff {
+                    delta: linear_backoff_delta,
+                },
             },
         });
         Self { client, shared }
@@ -352,44 +349,47 @@ impl MaspClient for IndexerMaspClient {
     type Error = Error;
 
     async fn last_block_height(&self) -> Result<Option<BlockHeight>, Error> {
-        use serde::Deserialize;
+        with_retry(&self.shared.backoff, &self.shared.sleep, async move {
+            use serde::Deserialize;
 
-        #[derive(Deserialize)]
-        struct Response {
-            block_height: u64,
-        }
+            #[derive(Deserialize)]
+            struct Response {
+                block_height: u64,
+            }
 
-        let _permit = self.shared.semaphore.acquire().await.unwrap();
+            let _permit = self.shared.semaphore.acquire().await.unwrap();
 
-        let response = self
-            .client
-            .get(self.endpoint("/height"))
-            .keep_alive()
-            .send()
-            .await
-            .map_err(|err| {
+            let response = self
+                .client
+                .get(self.endpoint("/height"))
+                .keep_alive()
+                .send()
+                .await
+                .map_err(|err| {
+                    Error::Other(format!(
+                        "Failed to fetch latest block height: {err}"
+                    ))
+                })?;
+            if !response.status().is_success() {
+                let err = Self::get_server_error(response).await?;
+                return Err(Error::Other(format!(
+                    "Failed to fetch last block height: {err}"
+                )));
+            }
+            let payload: Response = response.json().await.map_err(|err| {
                 Error::Other(format!(
-                    "Failed to fetch latest block height: {err}"
+                    "Could not deserialize latest block height JSON response: \
+                     {err}"
                 ))
             })?;
-        if !response.status().is_success() {
-            let err = Self::get_server_error(response).await?;
-            return Err(Error::Other(format!(
-                "Failed to fetch last block height: {err}"
-            )));
-        }
-        let payload: Response = response.json().await.map_err(|err| {
-            Error::Other(format!(
-                "Could not deserialize latest block height JSON response: \
-                 {err}"
-            ))
-        })?;
 
-        Ok(if payload.block_height != 0 {
-            Some(BlockHeight(payload.block_height))
-        } else {
-            None
+            Ok(if payload.block_height != 0 {
+                Some(BlockHeight(payload.block_height))
+            } else {
+                None
+            })
         })
+        .await
     }
 
     async fn fetch_shielded_transfers(
@@ -397,150 +397,157 @@ impl MaspClient for IndexerMaspClient {
         BlockHeight(mut from): BlockHeight,
         BlockHeight(to): BlockHeight,
     ) -> Result<Vec<IndexedNoteEntry>, Error> {
-        use std::ops::ControlFlow;
+        with_retry(&self.shared.backoff, &self.shared.sleep, async move {
+            use std::ops::ControlFlow;
 
-        use futures::stream::{self, StreamExt};
-        use serde::Deserialize;
+            use futures::stream::{self, StreamExt};
+            use serde::Deserialize;
 
-        #[derive(Deserialize)]
-        struct TransactionSlot {
-            masp_tx_index: u64,
-            is_masp_fee_payment: bool,
-            bytes: Vec<u8>,
-        }
+            #[derive(Deserialize)]
+            struct TransactionSlot {
+                masp_tx_index: u64,
+                is_masp_fee_payment: bool,
+                bytes: Vec<u8>,
+            }
 
-        #[derive(Deserialize)]
-        struct Transaction {
-            block_height: u64,
-            block_index: u64,
-            batch: Vec<TransactionSlot>,
-        }
+            #[derive(Deserialize)]
+            struct Transaction {
+                block_height: u64,
+                block_index: u64,
+                batch: Vec<TransactionSlot>,
+            }
 
-        #[derive(Deserialize)]
-        struct TxResponse {
-            txs: Vec<Transaction>,
-        }
+            #[derive(Deserialize)]
+            struct TxResponse {
+                txs: Vec<Transaction>,
+            }
 
-        if from > to {
-            return Err(Error::Other(format!(
-                "Invalid block range {from}-{to}: Beginning height {from} is \
-                 greater than ending height {to}"
-            )));
-        }
+            if from > to {
+                return Err(Error::Other(format!(
+                    "Invalid block range {from}-{to}: Beginning height {from} \
+                     is greater than ending height {to}"
+                )));
+            }
 
-        let maybe_block_index = self
-            .shared
-            .block_index
-            .try_init_async(async {
-                let _permit = self.shared.semaphore.acquire().await.unwrap();
-                self.last_block_index().await.ok()
-            })
-            .await
-            .and_then(Option::as_ref);
-
-        let mut fetches = vec![];
-        loop {
-            'do_while: {
-                const MAX_RANGE_THRES: u64 = 30;
-
-                let mut from_height = from;
-                let mut offset = (to - from).min(MAX_RANGE_THRES);
-                let mut to_height = from + offset;
-                from += offset;
-
-                // if the bloom filter has finished downloading, we can
-                // use it to avoid unnecessary fetches of block heights
-                // that contain no MASP notes.
-                //
-                // * `block_index_height` is the height at which the filter was
-                //   built.
-                // * `block_index` is the actual bloom filter.
-                if let Some((BlockHeight(block_index_height), block_index)) =
-                    maybe_block_index
-                {
-                    match BlockIndex::check_block_index(
-                        *block_index_height,
-                        from_height,
-                        to_height,
-                    )
-                    .needs_to_fetch(block_index)
-                    {
-                        ControlFlow::Break(()) => {
-                            // We do not need to fetch this range.
-                            //
-                            // NB: skips code below, so it's more like a
-                            // `continue`
-                            break 'do_while;
-                        }
-                        ControlFlow::Continue((from, to)) => {
-                            // the sub-range which we need to fetch.
-                            from_height = from;
-                            to_height = to;
-                            offset = to_height - from_height;
-                        }
-                    }
-                }
-
-                fetches.push(async move {
+            let maybe_block_index = self
+                .shared
+                .block_index
+                .try_init_async(async {
                     let _permit =
                         self.shared.semaphore.acquire().await.unwrap();
+                    self.last_block_index().await.ok()
+                })
+                .await
+                .and_then(Option::as_ref);
 
-                    let payload: TxResponse = {
-                        let response = self
-                            .client
-                            .get(self.endpoint("/tx"))
-                            .keep_alive()
-                            .query(&[
-                                ("height", from_height),
-                                ("height_offset", offset),
-                            ])
-                            .send()
-                            .await
-                            .map_err(|err| {
-                                Error::Other(format!(
-                                    "Failed to fetch transactions in the \
-                                     height range {from_height}-{to_height}: \
-                                     {err}"
-                                ))
-                            })?;
-                        if !response.status().is_success() {
-                            let err = Self::get_server_error(response).await?;
-                            return Err(Error::Other(format!(
-                                "Failed to fetch transactions in the range \
-                                 {from_height}-{to_height}: {err}"
-                            )));
+            let mut fetches = vec![];
+            loop {
+                'do_while: {
+                    const MAX_RANGE_THRES: u64 = 30;
+
+                    let mut from_height = from;
+                    let mut offset = (to - from).min(MAX_RANGE_THRES);
+                    let mut to_height = from + offset;
+                    from += offset;
+
+                    // if the bloom filter has finished downloading, we can
+                    // use it to avoid unnecessary fetches of block heights
+                    // that contain no MASP notes.
+                    //
+                    // * `block_index_height` is the height at which the filter
+                    //   was built.
+                    // * `block_index` is the actual bloom filter.
+                    if let Some((
+                        BlockHeight(block_index_height),
+                        block_index,
+                    )) = maybe_block_index
+                    {
+                        match BlockIndex::check_block_index(
+                            *block_index_height,
+                            from_height,
+                            to_height,
+                        )
+                        .needs_to_fetch(block_index)
+                        {
+                            ControlFlow::Break(()) => {
+                                // We do not need to fetch this range.
+                                //
+                                // NB: skips code below, so it's more like a
+                                // `continue`
+                                break 'do_while;
+                            }
+                            ControlFlow::Continue((from, to)) => {
+                                // the sub-range which we need to fetch.
+                                from_height = from;
+                                to_height = to;
+                                offset = to_height - from_height;
+                            }
                         }
-                        response.json().await.map_err(|err| {
-                            Error::Other(format!(
-                                "Could not deserialize the transactions JSON \
-                                 response in the height range \
-                                 {from_height}-{to_height}: {err}"
-                            ))
-                        })?
-                    };
+                    }
 
-                    Ok(payload.txs)
-                });
+                    fetches.push(async move {
+                        let _permit =
+                            self.shared.semaphore.acquire().await.unwrap();
+
+                        let payload: TxResponse = {
+                            let response = self
+                                .client
+                                .get(self.endpoint("/tx"))
+                                .keep_alive()
+                                .query(&[
+                                    ("height", from_height),
+                                    ("height_offset", offset),
+                                ])
+                                .send()
+                                .await
+                                .map_err(|err| {
+                                    Error::Other(format!(
+                                        "Failed to fetch transactions in the \
+                                         height range \
+                                         {from_height}-{to_height}: {err}"
+                                    ))
+                                })?;
+                            if !response.status().is_success() {
+                                let err =
+                                    Self::get_server_error(response).await?;
+                                return Err(Error::Other(format!(
+                                    "Failed to fetch transactions in the \
+                                     range {from_height}-{to_height}: {err}"
+                                )));
+                            }
+                            response.json().await.map_err(|err| {
+                                Error::Other(format!(
+                                    "Could not deserialize the transactions \
+                                     JSON response in the height range \
+                                     {from_height}-{to_height}: {err}"
+                                ))
+                            })?
+                        };
+
+                        Ok(payload.txs)
+                    });
+                }
+
+                if from >= to {
+                    break;
+                }
             }
 
-            if from >= to {
-                break;
-            }
-        }
+            let mut stream_of_fetches = stream::iter(fetches)
+                .buffer_unordered(self.shared.max_concurrent_fetches);
+            let mut txs = vec![];
 
-        let mut stream_of_fetches = stream::iter(fetches)
-            .buffer_unordered(self.shared.max_concurrent_fetches);
-        let mut txs = vec![];
-
-        while let Some(result) = stream_of_fetches.next().await {
-            for Transaction {
-                block_height,
-                block_index,
-                batch: transactions,
-            } in result?
-            {
-                for slot in transactions {
-                    let extracted_masp_tx = MaspTx::try_from_slice(&slot.bytes)
+            while let Some(result) = stream_of_fetches.next().await {
+                for Transaction {
+                    block_height,
+                    block_index,
+                    batch: transactions,
+                } in result?
+                {
+                    for slot in transactions {
+                        let extracted_masp_tx = MaspTx::try_from_slice(
+                            &slot.bytes,
+                        )
                         .map_err(|err| {
                             Error::Other(format!(
                                 "Could not deserialize the masp txs borsh \
@@ -550,27 +557,29 @@ impl MaspClient for IndexerMaspClient {
                             ))
                         })?;
 
-                    let kind = if slot.is_masp_fee_payment {
-                        MaspTxKind::FeePayment
-                    } else {
-                        MaspTxKind::Transfer
-                    };
-                    let masp_indexed_tx = MaspIndexedTx {
-                        kind,
-                        indexed_tx: IndexedTx {
-                            block_height: block_height.into(),
-                            block_index: TxIndex::must_from_usize(
-                                block_index as usize,
-                            ),
-                            batch_index: Some(slot.masp_tx_index as u32),
-                        },
-                    };
-                    txs.push((masp_indexed_tx, extracted_masp_tx));
+                        let kind = if slot.is_masp_fee_payment {
+                            MaspTxKind::FeePayment
+                        } else {
+                            MaspTxKind::Transfer
+                        };
+                        let masp_indexed_tx = MaspIndexedTx {
+                            kind,
+                            indexed_tx: IndexedTx {
+                                block_height: block_height.into(),
+                                block_index: TxIndex::must_from_usize(
+                                    block_index as usize,
+                                ),
+                                batch_index: Some(slot.masp_tx_index as u32),
+                            },
+                        };
+                        txs.push((masp_indexed_tx, extracted_masp_tx));
+                    }
                 }
             }
-        }
 
-        Ok(txs)
+            Ok(txs)
+        })
+        .await
     }
 
     #[inline(always)]
@@ -582,197 +591,207 @@ impl MaspClient for IndexerMaspClient {
         &self,
         BlockHeight(height): BlockHeight,
     ) -> Result<CommitmentTree<Node>, Error> {
-        use serde::Deserialize;
+        with_retry(&self.shared.backoff, &self.shared.sleep, async move {
+            use serde::Deserialize;
 
-        #[derive(Deserialize)]
-        struct Response {
-            commitment_tree: Vec<u8>,
-        }
+            #[derive(Deserialize)]
+            struct Response {
+                commitment_tree: Vec<u8>,
+            }
 
-        let _permit = self.shared.semaphore.acquire().await.unwrap();
+            let _permit = self.shared.semaphore.acquire().await.unwrap();
 
-        let response = self
-            .client
-            .get(self.endpoint("/commitment-tree"))
-            .keep_alive()
-            .query(&[("height", height)])
-            .send()
-            .await
-            .map_err(|err| {
-                Error::Other(format!(
+            let response = self
+                .client
+                .get(self.endpoint("/commitment-tree"))
+                .keep_alive()
+                .query(&[("height", height)])
+                .send()
+                .await
+                .map_err(|err| {
+                    Error::Other(format!(
+                        "Failed to fetch commitment tree at height {height}: \
+                         {err}"
+                    ))
+                })?;
+            if !response.status().is_success() {
+                let err = Self::get_server_error(response).await?;
+                return Err(Error::Other(format!(
                     "Failed to fetch commitment tree at height {height}: {err}"
+                )));
+            }
+            let payload: Response = response.json().await.map_err(|err| {
+                Error::Other(format!(
+                    "Could not deserialize the commitment tree JSON response \
+                     at height {height}: {err}"
                 ))
             })?;
-        if !response.status().is_success() {
-            let err = Self::get_server_error(response).await?;
-            return Err(Error::Other(format!(
-                "Failed to fetch commitment tree at height {height}: {err}"
-            )));
-        }
-        let payload: Response = response.json().await.map_err(|err| {
-            Error::Other(format!(
-                "Could not deserialize the commitment tree JSON response at \
-                 height {height}: {err}"
-            ))
-        })?;
 
-        BorshDeserialize::try_from_slice(&payload.commitment_tree).map_err(
-            |err| {
-                Error::Other(format!(
-                    "Could not deserialize the commitment tree borsh data at \
-                     height {height}: {err}"
-                ))
-            },
-        )
+            BorshDeserialize::try_from_slice(&payload.commitment_tree).map_err(
+                |err| {
+                    Error::Other(format!(
+                        "Could not deserialize the commitment tree borsh data \
+                         at height {height}: {err}"
+                    ))
+                },
+            )
+        })
+        .await
     }
 
     async fn fetch_note_index(
         &self,
         BlockHeight(height): BlockHeight,
     ) -> Result<BTreeMap<MaspIndexedTx, usize>, Error> {
-        use serde::Deserialize;
+        with_retry(&self.shared.backoff, &self.shared.sleep, async move {
+            use serde::Deserialize;
 
-        #[derive(Deserialize)]
-        struct Note {
-            note_position: usize,
-            #[serde(rename = "masp_tx_index")]
-            batch_index: u32,
-            block_index: u32,
-            block_height: u64,
-            is_masp_fee_payment: bool,
-        }
+            #[derive(Deserialize)]
+            struct Note {
+                note_position: usize,
+                #[serde(rename = "masp_tx_index")]
+                batch_index: u32,
+                block_index: u32,
+                block_height: u64,
+                is_masp_fee_payment: bool,
+            }
 
-        #[derive(Deserialize)]
-        struct Response {
-            notes_index: Vec<Note>,
-        }
+            #[derive(Deserialize)]
+            struct Response {
+                notes_index: Vec<Note>,
+            }
 
-        let _permit = self.shared.semaphore.acquire().await.unwrap();
+            let _permit = self.shared.semaphore.acquire().await.unwrap();
 
-        let response = self
-            .client
-            .get(self.endpoint("/notes-index"))
-            .keep_alive()
-            .query(&[("height", height)])
-            .send()
-            .await
-            .map_err(|err| {
-                Error::Other(format!(
+            let response = self
+                .client
+                .get(self.endpoint("/notes-index"))
+                .keep_alive()
+                .query(&[("height", height)])
+                .send()
+                .await
+                .map_err(|err| {
+                    Error::Other(format!(
+                        "Failed to fetch notes map at height {height}: {err}"
+                    ))
+                })?;
+            if !response.status().is_success() {
+                let err = Self::get_server_error(response).await?;
+                return Err(Error::Other(format!(
                     "Failed to fetch notes map at height {height}: {err}"
+                )));
+            }
+            let payload: Response = response.json().await.map_err(|err| {
+                Error::Other(format!(
+                    "Could not deserialize the notes map JSON response at \
+                     height {height}: {err}"
                 ))
             })?;
-        if !response.status().is_success() {
-            let err = Self::get_server_error(response).await?;
-            return Err(Error::Other(format!(
-                "Failed to fetch notes map at height {height}: {err}"
-            )));
-        }
-        let payload: Response = response.json().await.map_err(|err| {
-            Error::Other(format!(
-                "Could not deserialize the notes map JSON response at height \
-                 {height}: {err}"
-            ))
-        })?;
 
-        let mut masp_index = 0;
-        let mut prev_block_height = None;
+            let mut masp_index = 0;
+            let mut prev_block_height = None;
 
-        Ok(payload
-            .notes_index
-            .into_iter()
-            .map(
-                |Note {
-                     block_index,
-                     batch_index,
-                     block_height,
-                     note_position,
-                     is_masp_fee_payment,
-                 }| {
-                    if Some(block_height) != prev_block_height {
-                        masp_index = 0;
-                        prev_block_height = Some(block_height);
-                    } else {
-                        masp_index += 1;
-                    }
-                    (
-                        MaspIndexedTx {
-                            indexed_tx: IndexedTx {
-                                block_index: TxIndex(block_index),
-                                block_height: BlockHeight(block_height),
-                                batch_index: Some(batch_index),
+            Ok(payload
+                .notes_index
+                .into_iter()
+                .map(
+                    |Note {
+                         block_index,
+                         batch_index,
+                         block_height,
+                         note_position,
+                         is_masp_fee_payment,
+                     }| {
+                        if Some(block_height) != prev_block_height {
+                            masp_index = 0;
+                            prev_block_height = Some(block_height);
+                        } else {
+                            masp_index += 1;
+                        }
+                        (
+                            MaspIndexedTx {
+                                indexed_tx: IndexedTx {
+                                    block_index: TxIndex(block_index),
+                                    block_height: BlockHeight(block_height),
+                                    batch_index: Some(batch_index),
+                                },
+                                kind: if is_masp_fee_payment {
+                                    MaspTxKind::FeePayment
+                                } else {
+                                    MaspTxKind::Transfer
+                                },
                             },
-                            kind: if is_masp_fee_payment {
-                                MaspTxKind::FeePayment
-                            } else {
-                                MaspTxKind::Transfer
-                            },
-                        },
-                        note_position,
-                    )
-                },
-            )
-            .collect())
+                            note_position,
+                        )
+                    },
+                )
+                .collect())
+        })
+        .await
     }
 
     async fn fetch_witness_map(
         &self,
         BlockHeight(height): BlockHeight,
     ) -> Result<HashMap<usize, IncrementalWitness<Node>>, Error> {
-        use serde::Deserialize;
+        with_retry(&self.shared.backoff, &self.shared.sleep, async move {
+            use serde::Deserialize;
 
-        #[derive(Deserialize)]
-        struct Witness {
-            bytes: Vec<u8>,
-            index: usize,
-        }
+            #[derive(Deserialize)]
+            struct Witness {
+                bytes: Vec<u8>,
+                index: usize,
+            }
 
-        #[derive(Deserialize)]
-        struct WitnessMapResponse {
-            witnesses: Vec<Witness>,
-        }
+            #[derive(Deserialize)]
+            struct WitnessMapResponse {
+                witnesses: Vec<Witness>,
+            }
 
-        let _permit = self.shared.semaphore.acquire().await.unwrap();
+            let _permit = self.shared.semaphore.acquire().await.unwrap();
 
-        let response = self
-            .client
-            .get(self.endpoint("/witness-map"))
-            .keep_alive()
-            .query(&[("height", height)])
-            .send()
-            .await
-            .map_err(|err| {
-                Error::Other(format!(
+            let response = self
+                .client
+                .get(self.endpoint("/witness-map"))
+                .keep_alive()
+                .query(&[("height", height)])
+                .send()
+                .await
+                .map_err(|err| {
+                    Error::Other(format!(
+                        "Failed to fetch witness map at height {height}: {err}"
+                    ))
+                })?;
+            if !response.status().is_success() {
+                let err = Self::get_server_error(response).await?;
+                return Err(Error::Other(format!(
                     "Failed to fetch witness map at height {height}: {err}"
-                ))
-            })?;
-        if !response.status().is_success() {
-            let err = Self::get_server_error(response).await?;
-            return Err(Error::Other(format!(
-                "Failed to fetch witness map at height {height}: {err}"
-            )));
-        }
-        let payload: WitnessMapResponse =
-            response.json().await.map_err(|err| {
-                Error::Other(format!(
-                    "Could not deserialize the witness map JSON response at \
-                     height {height}: {err}"
-                ))
-            })?;
+                )));
+            }
+            let payload: WitnessMapResponse =
+                response.json().await.map_err(|err| {
+                    Error::Other(format!(
+                        "Could not deserialize the witness map JSON response \
+                         at height {height}: {err}"
+                    ))
+                })?;
 
-        payload.witnesses.into_iter().try_fold(
-            HashMap::new(),
-            |mut accum, Witness { index, bytes }| {
-                let witness = BorshDeserialize::try_from_slice(&bytes)
-                    .map_err(|err| {
-                        Error::Other(format!(
-                            "Could not deserialize the witness borsh data at \
-                             height {height}: {err}"
-                        ))
-                    })?;
-                accum.insert(index, witness);
-                Ok(accum)
-            },
-        )
+            payload.witnesses.into_iter().try_fold(
+                HashMap::new(),
+                |mut accum, Witness { index, bytes }| {
+                    let witness = BorshDeserialize::try_from_slice(&bytes)
+                        .map_err(|err| {
+                            Error::Other(format!(
+                                "Could not deserialize the witness borsh data \
+                                 at height {height}: {err}"
+                            ))
+                        })?;
+                    accum.insert(index, witness);
+                    Ok(accum)
+                },
+            )
+        })
+        .await
     }
 
     async fn commitment_anchor_exists(
@@ -879,6 +898,34 @@ impl BlockIndex {
             }
         }
     }
+}
+
+async fn with_retry<F, T, E>(
+    backoff: &RwLock<Duration>,
+    sleep: &Sleep<LinearBackoff>,
+    fut: F,
+) -> Result<T, E>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    const ZERO: Duration = Duration::from_secs(0);
+    let current_backoff = { *backoff.read().unwrap() };
+
+    if current_backoff > ZERO {
+        sleep.sleep_with_current_backoff(&current_backoff).await;
+    }
+
+    let result = fut.await;
+
+    if result.is_err() {
+        let mut backoff = backoff.write().unwrap();
+        sleep.strategy.next_state(&mut *backoff);
+    } else if current_backoff > ZERO {
+        let mut backoff = backoff.write().unwrap();
+        sleep.strategy.prev_state(&mut *backoff);
+    }
+
+    result
 }
 
 #[cfg(test)]

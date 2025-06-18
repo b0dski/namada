@@ -131,6 +131,7 @@ pub async fn syncing<
             url,
             true,
             args.max_concurrent_fetches,
+            Duration::from_millis(5),
         ))?
     } else {
         display_line!(

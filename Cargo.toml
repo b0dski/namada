@@ -283,5 +283,10 @@ opt-level = 3
 panic = "unwind"
 overflow-checks = true
 
+[profile.maxperf]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
 [profile.dev.package.namada_fuzz]
 opt-level = 3

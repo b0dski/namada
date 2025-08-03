@@ -8,6 +8,8 @@ PROPTEST_CASES ?= 100
 # Disable shrinking in `make test-pos-sm` for CI runs. If the test fail in CI,
 # we only want to get the seed.
 PROPTEST_MAX_SHRINK_ITERS ?= 0
+# default cpu arch for `maxperf` target, overridable from shell
+MAXPERF_CPU ?= native
 
 cargo := $(env) cargo
 rustup := $(env) rustup
@@ -83,8 +85,23 @@ build-release:
 		--features jemalloc \
 		--features migrations
 
+build-maxperf:
+	RUSTFLAGS="${RUSTFLAGS} -C target-cpu=${MAXPERF_CPU}" \
+	$(cargo) build $(jobs) --profile maxperf --timings --package namada_apps \
+		--manifest-path Cargo.toml \
+		--no-default-features \
+		--features jemalloc \
+		--features migrations
+
 build-release-no-jemalloc:
 	$(cargo) build $(jobs) --release --timings --package namada_apps \
+		--manifest-path Cargo.toml \
+		--no-default-features \
+		--features migrations
+
+build-maxperf-no-jemalloc:
+	RUSTFLAGS="${RUST_FLAGS} -C target-cpu=${MAXPERF_CPU}" \
+	$(cargo) build $(jobs) --profile maxperf --timings --package namada_apps \
 		--manifest-path Cargo.toml \
 		--no-default-features \
 		--features migrations
